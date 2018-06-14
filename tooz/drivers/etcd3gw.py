@@ -13,9 +13,10 @@
 # under the License.
 
 from __future__ import absolute_import
-import base64
-import threading
 import uuid
+import base64
+import functools
+import threading
 
 import etcd3gw
 from etcd3gw import exceptions as etcd3_exc
@@ -124,7 +125,7 @@ class Etcd3Lock(locking.Lock):
                 'key': self._key_b64,
                 'result': 'EQUAL',
                 'target': 'VALUE',
-                'value': self._uuid
+                'value': self._uuid,
             }],
             'success': [{
                 'request_delete_range': {
@@ -161,7 +162,8 @@ class Etcd3Lock(locking.Lock):
         return False
 
 
-class Etcd3Driver(coordination.CoordinationDriverWithExecutor):
+class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
+                  coordination.CoordinationDriverWithExecutor):
     """An etcd based driver.
 
     This driver uses etcd provide the coordination driver semantics and
@@ -171,6 +173,9 @@ class Etcd3Driver(coordination.CoordinationDriverWithExecutor):
     #: Default socket/lock/member/leader timeout used when none is provided.
     DEFAULT_TIMEOUT = 30
 
+    #: Default timeout for lock used for leader election
+    DEFAULT_LEADER_LOCK_TIMEOUT = 30
+
     #: Default hostname used when none is provided.
     DEFAULT_HOST = "localhost"
 
@@ -178,6 +183,8 @@ class Etcd3Driver(coordination.CoordinationDriverWithExecutor):
     DEFAULT_PORT = 2379
 
     GROUP_PREFIX = b"tooz/groups/"
+
+    GROUP_LEADER_SUFFIX = b'TOOZ_GROUP_LEADER'
 
     def __init__(self, member_id, parsed_url, options):
         super(Etcd3Driver, self).__init__(member_id, parsed_url, options)
@@ -187,6 +194,8 @@ class Etcd3Driver(coordination.CoordinationDriverWithExecutor):
         timeout = int(options.get('timeout', self.DEFAULT_TIMEOUT))
         self.client = etcd3gw.client(host=host, port=port, timeout=timeout)
         self.lock_timeout = int(options.get('lock_timeout', timeout))
+        self.leader_timeout = int(self._options.get(
+            'leader_timeout', self.DEFAULT_TIMEOUT))
         self.membership_timeout = int(options.get(
             'membership_timeout', timeout))
         self._acquired_locks = set()
@@ -218,6 +227,11 @@ class Etcd3Driver(coordination.CoordinationDriverWithExecutor):
 
     def _encode_group_id(self, group_id):
         return _encode(self._prefix_group(group_id))
+
+    def _group_leader_key(self, group_id):
+        prefix_group = self._prefix_group(group_id)
+        result = prefix_group + self.GROUP_LEADER_SUFFIX
+        return result
 
     def _prefix_group(self, group_id):
         return b"%s%s/" % (self.GROUP_PREFIX, group_id)
@@ -405,3 +419,20 @@ class Etcd3Driver(coordination.CoordinationDriverWithExecutor):
                 group[1]['key'][len(self.GROUP_PREFIX):-1] for group in groups]
         return coordination.CoordinatorResult(
             self._executor.submit(_get_groups))
+
+    def _get_leader_lock(self, group_id):
+        name = self._group_leader_key(group_id)
+        return Etcd3Lock(self, name, self.leader_timeout)
+
+    def run_elect_coordinator(self):
+        for group_id, hooks in six.iteritems(self._hooks_elected_leader):
+            leader_lock = self._get_leader_lock(group_id)
+            if leader_lock.acquire(blocking=False):
+                # We got the lock
+                hooks.run(coordination.LeaderElected(group_id,
+                                                     self._member_id))
+
+    def run_watchers(self, timeout=None):
+        result = super(Etcd3Driver, self).run_watchers(timeout=timeout)
+        self.run_elect_coordinator()
+        return result
