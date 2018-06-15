@@ -126,6 +126,8 @@ class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
     #: Default port used if none provided (4001 or 2379 are the common ones).
     DEFAULT_PORT = 2379
 
+    GROUP_LEADER_SUFFIX = b'TOOZ_GROUP_LEADER'
+
     def __init__(self, member_id, parsed_url, options):
         super(Etcd3Driver, self).__init__(member_id, parsed_url, options)
         host = parsed_url.hostname or self.DEFAULT_HOST
@@ -134,6 +136,8 @@ class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
         timeout = int(options.get('timeout', self.DEFAULT_TIMEOUT))
         self.client = etcd3.client(host=host, port=port, timeout=timeout)
         self.lock_timeout = int(options.get('lock_timeout', timeout))
+        self.leader_timeout = int(self._options.get(
+            'leader_timeout', self.DEFAULT_TIMEOUT))
         self.membership_timeout = int(options.get(
             'membership_timeout', timeout))
         self._acquired_locks = set()
@@ -158,6 +162,11 @@ class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
         return min(self.lock_timeout, self.membership_timeout)
 
     GROUP_PREFIX = b"tooz/groups/"
+
+    def _group_leader_key(self, group_id):
+        prefix_group = self._encode_group_id(group_id)
+        result = prefix_group + self.GROUP_LEADER_SUFFIX
+        return result
 
     def _encode_group_id(self, group_id):
         return self.GROUP_PREFIX + group_id + b"/"
@@ -330,13 +339,22 @@ class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
         return EtcdFutureResult(
             self._executor.submit(_update_capabilities))
 
-    @staticmethod
-    def watch_elected_as_leader(group_id, callback):
-        raise tooz.NotImplemented
+    def _get_leader_lock(self, group_id):
+        name = self._group_leader_key(group_id)
+        return Etcd3Lock(self, name, self.leader_timeout)
 
-    @staticmethod
-    def unwatch_elected_as_leader(group_id, callback):
-        raise tooz.NotImplemented
+    def run_elect_coordinator(self):
+        for group_id, hooks in six.iteritems(self._hooks_elected_leader):
+            leader_lock = self._get_leader_lock(group_id)
+            if leader_lock.acquire(blocking=False):
+                # We got the lock
+                hooks.run(coordination.LeaderElected(group_id,
+                                                     self._member_id))
+
+    def run_watchers(self, timeout=None):
+        result = super(Etcd3Driver, self).run_watchers(timeout=timeout)
+        self.run_elect_coordinator()
+        return result
 
 
 EtcdFutureResult = functools.partial(coordination.CoordinatorResult,
