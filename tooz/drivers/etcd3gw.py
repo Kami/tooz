@@ -58,17 +58,12 @@ def _translate_failures(func):
     return wrapper
 
 
-class Etcd3Lock(locking.Lock):
-    """An etcd3-specific lock.
-
-    Thin wrapper over etcd3's lock object basically to provide the heartbeat()
-    semantics for the coordination driver.
-    """
+class BaseEtcd3Lock(locking.Lock):
 
     LOCK_PREFIX = b"/tooz/locks"
 
     def __init__(self, coord, name, timeout):
-        super(Etcd3Lock, self).__init__(name)
+        super(BaseEtcd3Lock, self).__init__(name)
         self._timeout = timeout
         self._coord = coord
         self._key = self.LOCK_PREFIX + name
@@ -76,8 +71,7 @@ class Etcd3Lock(locking.Lock):
         self._uuid = _encode(uuid.uuid4().bytes)
         self._exclusive_access = threading.Lock()
 
-    @_translate_failures
-    def acquire(self, blocking=True, shared=False):
+    def _acquire(self, txn, blocking=True, shared=False):
         if shared:
             raise tooz.NotImplemented
 
@@ -85,27 +79,6 @@ class Etcd3Lock(locking.Lock):
         def _acquire():
             # TODO(jd): save the created revision so we can check it later to
             # make sure we still have the lock
-            self._lease = self._coord.client.lease(self._timeout)
-            txn = {
-                'compare': [{
-                    'key': self._key_b64,
-                    'result': 'EQUAL',
-                    'target': 'CREATE',
-                    'create_revision': 0
-                }],
-                'success': [{
-                    'request_put': {
-                        'key': self._key_b64,
-                        'value': self._uuid,
-                        'lease': self._lease.id
-                    }
-                }],
-                'failure': [{
-                    'request_range': {
-                        'key': self._key_b64
-                    }
-                }]
-            }
             result = self._coord.client.transaction(txn)
             success = result.get('succeeded', False)
 
@@ -117,6 +90,49 @@ class Etcd3Lock(locking.Lock):
             return True
 
         return _acquire()
+
+    def _release(self, txn):
+        with self._exclusive_access:
+            result = self._coord.client.transaction(txn)
+            success = result.get('succeeded', False)
+            if success:
+                self._coord._acquired_locks.remove(self)
+                return True
+        return False
+
+
+class Etcd3Lock(BaseEtcd3Lock):
+    """An etcd3-specific lock.
+
+    Thin wrapper over etcd3's lock object basically to provide the heartbeat()
+    semantics for the coordination driver.
+    """
+
+    @_translate_failures
+    def acquire(self, blocking=True, shared=False):
+        self._lease = self._coord.client.lease(self._timeout)
+        txn = {
+            'compare': [{
+                'key': self._key_b64,
+                'result': 'EQUAL',
+                'target': 'CREATE',
+                'create_revision': 0
+            }],
+            'success': [{
+                'request_put': {
+                    'key': self._key_b64,
+                    'value': self._uuid,
+                    'lease': self._lease.id
+                }
+            }],
+            'failure': [{
+                'request_range': {
+                    'key': self._key_b64
+                }
+            }]
+        }
+
+        return self._acquire(txn=txn, blocking=blocking, shared=shared)
 
     @_translate_failures
     def release(self):
@@ -134,13 +150,7 @@ class Etcd3Lock(locking.Lock):
             }]
         }
 
-        with self._exclusive_access:
-            result = self._coord.client.transaction(txn)
-            success = result.get('succeeded', False)
-            if success:
-                self._coord._acquired_locks.remove(self)
-                return True
-        return False
+        return self._release(txn=txn)
 
     @_translate_failures
     def break_(self):
@@ -160,6 +170,84 @@ class Etcd3Lock(locking.Lock):
                 self._lease.refresh()
                 return True
         return False
+
+
+class Etcd3LeaderLock(Etcd3Lock):
+    """
+    Special version of etcd3 lock used for leader election purposes.
+
+    In addition to the key used for a lock, this Lock class stores another key
+    which contains member id of a current leader.
+
+    This allows us to implement "get_leader()" method.
+    """
+
+    def __init__(self, coord, name, timeout):
+        super(Etcd3LeaderLock, self).__init__(coord=coord, name=name,
+                                              timeout=timeout)
+
+        self._leader_key = self._key + 'LEADER_MEMBER_ID'
+        self._leader_key_b64 = _encode(self._leader_key)
+        self._member_id_b64 = _encode(self._coord._member_id)
+        self._exclusive_access = threading.Lock()
+
+    @_translate_failures
+    def acquire(self, blocking=True, shared=False):
+        self._lease = self._coord.client.lease(self._timeout)
+        txn = {
+            'compare': [{
+                'key': self._key_b64,
+                'result': 'EQUAL',
+                'target': 'CREATE',
+                'create_revision': 0
+            }],
+            'success': [
+                {
+                    'request_put': {
+                        'key': self._key_b64,
+                        'value': self._uuid,
+                        'lease': self._lease.id
+                    },
+                },
+                {
+                    'request_put': {
+                        'key': self._leader_key_b64,
+                        'value': self._member_id_b64,
+                        'lease': self._lease.id
+                    }
+                }
+            ],
+            'failure': [{
+                'request_range': {
+                    'key': self._key_b64
+                }
+            }]
+        }
+        return self._acquire(txn=txn, blocking=blocking, shared=shared)
+
+    @_translate_failures
+    def release(self):
+        txn = {
+            'compare': [{
+                'key': self._key_b64,
+                'result': 'EQUAL',
+                'target': 'VALUE',
+                'value': self._uuid,
+            }],
+            'success': [
+                {
+                    'request_delete_range': {
+                        'key': self._key_b64
+                    },
+                },
+                {
+                    'request_delete_range': {
+                        'key': self._leader_key_b64
+                    }
+                }
+            ]
+        }
+        return self._release(txn=txn)
 
 
 class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
@@ -422,7 +510,22 @@ class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
 
     def _get_leader_lock(self, group_id):
         name = self._group_leader_key(group_id)
-        return Etcd3Lock(self, name, self.leader_timeout)
+        return Etcd3LeaderLock(self, name, self.leader_timeout)
+
+    def get_leader(self, group_id):
+        def _get_leader():
+            lock = self._get_leader_lock(group_id)
+
+            result = self.client.get(lock._leader_key)
+
+            if result:
+                leader = result[0]
+            else:
+                leader = None
+
+            return leader
+
+        return Etcd3FutureResult(self._executor.submit(_get_leader))
 
     def run_elect_coordinator(self):
         for group_id, hooks in six.iteritems(self._hooks_elected_leader):
@@ -436,3 +539,7 @@ class Etcd3Driver(coordination.CoordinationDriverCachedRunWatchers,
         result = super(Etcd3Driver, self).run_watchers(timeout=timeout)
         self.run_elect_coordinator()
         return result
+
+
+Etcd3FutureResult = functools.partial(
+    coordination.CoordinatorResult)
